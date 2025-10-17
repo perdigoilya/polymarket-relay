@@ -114,25 +114,57 @@ router.delete('/credentials/:userId', authenticateRequest, async (req, res) => {
  */
 router.post('/trade', authenticateRequest, rateLimiter, async (req, res) => {
   try {
-    const { userId, signedOrder, walletAddress, funderAddress } = req.body;
+    const { userId, signedOrder, walletAddress, funderAddress, credentials: providedCreds } = req.body;
     
-    if (!userId || !signedOrder || !walletAddress) {
-      return res.status(400).json({ error: 'Missing required fields: userId, signedOrder, walletAddress' });
+    console.log('📝 Trade request received:', {
+      hasUserId: !!userId,
+      hasSignedOrder: !!signedOrder,
+      hasWalletAddress: !!walletAddress,
+      hasProvidedCreds: !!providedCreds,
+      credsKeys: providedCreds ? Object.keys(providedCreds) : []
+    });
+    
+    if (!signedOrder || !walletAddress) {
+      return res.status(400).json({ error: 'Missing required fields: signedOrder, walletAddress' });
     }
     
-    // Fetch credentials
-    const db = getDb();
     let credentials;
     
-    if (isPostgres()) {
-      const { rows } = await db.query('SELECT * FROM user_credentials WHERE user_id = $1', [userId]);
-      credentials = rows[0];
-    } else {
-      credentials = db.prepare('SELECT * FROM user_credentials WHERE user_id = ?').get(userId);
+    // PRIORITY 1: Use credentials provided directly in request body
+    if (providedCreds && providedCreds.api_key && providedCreds.secret && providedCreds.passphrase) {
+      credentials = providedCreds;
+      console.log('✅ Using provided credentials from request body');
+    } else if (userId) {
+      // PRIORITY 2: Try to fetch from database as fallback
+      console.log('🔍 No valid credentials in request, trying database lookup...');
+      const db = getDb();
+      
+      if (isPostgres()) {
+        const { rows } = await db.query('SELECT * FROM user_credentials WHERE user_id = $1', [userId]);
+        credentials = rows[0];
+      } else {
+        credentials = db.prepare('SELECT * FROM user_credentials WHERE user_id = ?').get(userId);
+      }
+      
+      if (credentials) {
+        console.log('✅ Fetched credentials from database');
+      } else {
+        console.log('❌ No credentials found in database');
+      }
     }
     
     if (!credentials) {
+      console.error('❌ CREDENTIALS ERROR: No credentials available');
       return res.status(404).json({ error: 'Credentials not found. Please connect your wallet first.' });
+    }
+    
+    if (!credentials.api_key || !credentials.secret || !credentials.passphrase) {
+      console.error('❌ INCOMPLETE CREDENTIALS:', { 
+        hasApiKey: !!credentials.api_key, 
+        hasSecret: !!credentials.secret, 
+        hasPassphrase: !!credentials.passphrase 
+      });
+      return res.status(400).json({ error: 'Incomplete credentials. Missing api_key, secret, or passphrase.' });
     }
     
     console.log(`📝 Executing trade for user ${userId.slice(0, 8)}...`);
