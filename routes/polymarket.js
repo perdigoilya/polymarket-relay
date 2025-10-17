@@ -1,9 +1,42 @@
+// Polymarket trading routes using official @polymarket/clob-client
 import express from 'express';
+import { createClobClient, placeOrder } from '../utils/clobClient.js';
 import { getDb, isPostgres } from '../db/init.js';
 import { authenticateRequest, rateLimiter } from '../middleware/auth.js';
-import { executeTrade, checkTradingStatus } from '../utils/polymarket.js';
 
 const router = express.Router();
+
+/**
+ * GET /api/polymarket/ip
+ * Get relay server's public egress IP
+ * This IP needs to be whitelisted by Polymarket
+ */
+router.get('/ip', async (req, res) => {
+  try {
+    // Check egress IP by calling a service that echoes it back
+    const response = await fetch('https://api.ipify.org?format=json');
+    const data = await response.json();
+    
+    res.json({
+      success: true,
+      egressIp: data.ip,
+      message: 'This is the IP address that Polymarket sees from this relay server',
+      instructions: 'Contact Polymarket support to whitelist this IP for CLOB API access',
+      whitelistRequest: {
+        email: 'support@polymarket.com',
+        subject: 'IP Whitelist Request for Trading Application',
+        body: `Hello Polymarket,\n\nI'm building a trading application and need to whitelist my server IP for CLOB API access.\n\nIP Address: ${data.ip}\nUse Case: Prediction markets trading platform\n\nThank you!`
+      }
+    });
+  } catch (error) {
+    console.error('Failed to detect egress IP:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to detect egress IP',
+      details: error.message
+    });
+  }
+});
 
 /**
  * POST /api/polymarket/credentials
@@ -50,8 +83,121 @@ router.post('/credentials', authenticateRequest, async (req, res) => {
 });
 
 /**
+ * POST /api/polymarket/trade
+ * Execute trade using official ClobClient
+ */
+router.post('/trade', authenticateRequest, rateLimiter, async (req, res) => {
+  try {
+    const { userId, signedOrder, walletAddress, funderAddress, credentials: providedCreds } = req.body;
+    
+    console.log('\n[TRADE-RELAY-V2] Processing order:', {
+      hasUserId: !!userId,
+      hasSignedOrder: !!signedOrder,
+      hasWalletAddress: !!walletAddress,
+      hasProvidedCreds: !!providedCreds,
+      tokenId: signedOrder?.tokenId?.slice(0, 20) + '...'
+    });
+    
+    if (!signedOrder || !walletAddress) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Missing required fields: signedOrder, walletAddress' 
+      });
+    }
+    
+    // Get credentials
+    let credentials;
+    if (providedCreds && providedCreds.api_key && providedCreds.secret && providedCreds.passphrase) {
+      credentials = {
+        apiKey: providedCreds.api_key,
+        secret: providedCreds.secret,
+        passphrase: providedCreds.passphrase,
+        walletAddress
+      };
+      console.log('[TRADE-RELAY-V2] Using provided credentials');
+    } else if (userId) {
+      const db = getDb();
+      let dbCreds;
+      
+      if (isPostgres()) {
+        const { rows } = await db.query('SELECT * FROM user_credentials WHERE user_id = $1', [userId]);
+        dbCreds = rows[0];
+      } else {
+        dbCreds = db.prepare('SELECT * FROM user_credentials WHERE user_id = ?').get(userId);
+      }
+      
+      if (dbCreds) {
+        credentials = {
+          apiKey: dbCreds.api_key,
+          secret: dbCreds.secret,
+          passphrase: dbCreds.passphrase,
+          walletAddress: dbCreds.wallet_address
+        };
+        console.log('[TRADE-RELAY-V2] Using stored credentials');
+      }
+    }
+    
+    if (!credentials) {
+      return res.status(401).json({
+        success: false,
+        error: 'No credentials available. Please connect your wallet first.'
+      });
+    }
+    
+    // Get private key from environment (for signing with ClobClient)
+    const privateKey = process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY;
+    if (!privateKey) {
+      return res.status(500).json({
+        success: false,
+        error: 'Server configuration error: WALLET_PRIVATE_KEY not set'
+      });
+    }
+    
+    // Create ClobClient and execute trade
+    try {
+      const client = createClobClient(credentials, privateKey);
+      const result = await placeOrder(client, signedOrder);
+      
+      console.log('[TRADE-RELAY-V2] ✓ Trade successful');
+      res.json(result);
+      
+    } catch (error) {
+      const errorMessage = error.message || String(error);
+      const isCloudflareBlock = errorMessage.includes('403') || 
+                               errorMessage.includes('Cloudflare') ||
+                               errorMessage.includes('blocked');
+      
+      console.error('[TRADE-RELAY-V2] ✗ Trade failed:', errorMessage);
+      
+      if (isCloudflareBlock) {
+        res.status(403).json({
+          success: false,
+          error: 'Cloudflare 403 - egress blocked',
+          cloudflareBlock: true,
+          suggestion: 'Relay server IP needs to be whitelisted by Polymarket. Call GET /api/polymarket/ip to see the IP address.'
+        });
+      } else {
+        res.status(500).json({
+          success: false,
+          error: errorMessage,
+          cloudflareBlock: false
+        });
+      }
+    }
+    
+  } catch (error) {
+    console.error('[TRADE-RELAY-V2] Fatal error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Internal server error',
+      details: error.message 
+    });
+  }
+});
+
+/**
  * GET /api/polymarket/credentials/:userId
- * Get user credentials (for debugging only - remove in production)
+ * Get user credentials (masked)
  */
 router.get('/credentials/:userId', authenticateRequest, async (req, res) => {
   try {
@@ -70,7 +216,6 @@ router.get('/credentials/:userId', authenticateRequest, async (req, res) => {
       return res.status(404).json({ error: 'Credentials not found' });
     }
     
-    // Mask sensitive data
     res.json({
       userId: result.user_id,
       walletAddress: result.wallet_address,
@@ -100,7 +245,6 @@ router.delete('/credentials/:userId', authenticateRequest, async (req, res) => {
     }
     
     console.log(`🗑️  Deleted credentials for user ${userId.slice(0, 8)}...`);
-    
     res.json({ success: true });
   } catch (error) {
     console.error('Error deleting credentials:', error);
@@ -109,136 +253,17 @@ router.delete('/credentials/:userId', authenticateRequest, async (req, res) => {
 });
 
 /**
- * POST /api/polymarket/trade
- * Execute trade with dual-address retry logic
+ * GET /api/polymarket/health
+ * Health check
  */
-router.post('/trade', authenticateRequest, rateLimiter, async (req, res) => {
-  try {
-    const { userId, signedOrder, walletAddress, funderAddress, credentials: providedCreds } = req.body;
-    
-    console.log('📝 Trade request received:', {
-      hasUserId: !!userId,
-      hasSignedOrder: !!signedOrder,
-      hasWalletAddress: !!walletAddress,
-      hasProvidedCreds: !!providedCreds,
-      credsKeys: providedCreds ? Object.keys(providedCreds) : []
-    });
-    
-    if (!signedOrder || !walletAddress) {
-      return res.status(400).json({ error: 'Missing required fields: signedOrder, walletAddress' });
-    }
-    
-    let credentials;
-    
-    // PRIORITY 1: Use credentials provided directly in request body
-    if (providedCreds && providedCreds.api_key && providedCreds.secret && providedCreds.passphrase) {
-      credentials = providedCreds;
-      console.log('✅ Using provided credentials from request body');
-    } else if (userId) {
-      // PRIORITY 2: Try to fetch from database as fallback
-      console.log('🔍 No valid credentials in request, trying database lookup...');
-      const db = getDb();
-      
-      if (isPostgres()) {
-        const { rows } = await db.query('SELECT * FROM user_credentials WHERE user_id = $1', [userId]);
-        credentials = rows[0];
-      } else {
-        credentials = db.prepare('SELECT * FROM user_credentials WHERE user_id = ?').get(userId);
-      }
-      
-      if (credentials) {
-        console.log('✅ Fetched credentials from database');
-      } else {
-        console.log('❌ No credentials found in database');
-      }
-    }
-    
-    if (!credentials) {
-      console.error('❌ CREDENTIALS ERROR: No credentials available');
-      return res.status(404).json({ error: 'Credentials not found. Please connect your wallet first.' });
-    }
-    
-    if (!credentials.api_key || !credentials.secret || !credentials.passphrase) {
-      console.error('❌ INCOMPLETE CREDENTIALS:', { 
-        hasApiKey: !!credentials.api_key, 
-        hasSecret: !!credentials.secret, 
-        hasPassphrase: !!credentials.passphrase 
-      });
-      return res.status(400).json({ error: 'Incomplete credentials. Missing api_key, secret, or passphrase.' });
-    }
-    
-    console.log(`📝 Executing trade for user ${userId.slice(0, 8)}...`);
-    console.log(`   Token: ${signedOrder.tokenId}`);
-    console.log(`   Side: ${signedOrder.side === 0 ? 'BUY' : 'SELL'}`);
-    console.log(`   Amount: ${signedOrder.makerAmount}`);
-    
-    // Execute trade with dual-address retry
-    const result = await executeTrade(
-      credentials,
-      signedOrder,
-      walletAddress,
-      funderAddress || credentials.funder_address
-    );
-    
-    if (result.success) {
-      console.log(`✅ Trade successful! Order ID: ${result.orderId}`);
-      res.json({
-        success: true,
-        orderId: result.orderId,
-        attemptedWith: result.attemptedWith
-      });
-    } else {
-      console.error(`❌ Trade failed:`, result.error);
-      res.status(result.status || 400).json({
-        success: false,
-        error: result.error,
-        attemptedWith: result.attemptedWith
-      });
-    }
-  } catch (error) {
-    console.error('Error executing trade:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * GET /api/polymarket/status
- * Check if user's trading is enabled
- */
-router.get('/status', authenticateRequest, async (req, res) => {
-  try {
-    const { userId } = req.query;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId parameter' });
-    }
-    
-    const db = getDb();
-    let credentials;
-    
-    if (isPostgres()) {
-      const { rows } = await db.query('SELECT * FROM user_credentials WHERE user_id = $1', [userId]);
-      credentials = rows[0];
-    } else {
-      credentials = db.prepare('SELECT * FROM user_credentials WHERE user_id = ?').get(userId);
-    }
-    
-    if (!credentials) {
-      return res.status(404).json({ error: 'Credentials not found' });
-    }
-    
-    const status = await checkTradingStatus(
-      credentials.wallet_address,
-      credentials.api_key,
-      credentials.secret,
-      credentials.passphrase
-    );
-    
-    res.json(status);
-  } catch (error) {
-    console.error('Error checking status:', error);
-    res.status(500).json({ error: 'Failed to check status' });
-  }
+router.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    service: 'polymarket-relay',
+    version: '2.0.0',
+    client: '@polymarket/clob-client v4.22.7',
+    timestamp: new Date().toISOString()
+  });
 });
 
 export default router;
