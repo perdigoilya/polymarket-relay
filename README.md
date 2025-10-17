@@ -1,111 +1,174 @@
-# Polymarket Relay Server
+# Polymarket Trading Relay Server
 
-External relay service for bypassing Cloudflare WAF blocks when trading on Polymarket CLOB API.
+A relay server for Polymarket CLOB API trading, using the official `@polymarket/clob-client`.
 
-## Features
+## Why a Relay Server?
 
-- ✅ **Dual-address retry logic**: Tries owner address first, falls back to funder on 403
-- ✅ **HMAC-SHA256 signing**: Exact port from working Edge Function logic
-- ✅ **Browser-like headers**: Full set to bypass Cloudflare WAF
-- ✅ **Secure credential storage**: Per-user API keys, secrets, and passphrases
-- ✅ **Rate limiting**: 10 requests/min per userId
-- ✅ **API authentication**: Shared secret between Lovable app and relay
-- ✅ **PostgreSQL or SQLite**: Auto-detect based on environment
+Polymarket's CLOB API uses Cloudflare bot protection that blocks requests from:
+- Browser frontends (CORS + bot detection)
+- Most cloud providers (AWS Lambda, Vercel, Supabase Edge Functions, etc.)
+
+**Solution**: Run this relay server on infrastructure with a **whitelisted IP address**.
+
+## Architecture
+
+```
+Frontend (Browser)
+    ↓ [wallet signs order]
+    ↓
+Edge Function (validates user auth)
+    ↓ [forwards with API_SECRET_KEY]
+    ↓
+Relay Server (whitelisted IP + official ClobClient)
+    ↓ [authenticated with L2 API credentials]
+    ↓
+Polymarket CLOB API ✅
+```
 
 ## Quick Start
 
-### Development (Local)
+### 1. Install Dependencies
 
 ```bash
-# Install dependencies
+cd relay
 npm install
-
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your settings
-# (For local dev, defaults work fine)
-
-# Start server
-npm run dev
 ```
 
-Server will run on `http://localhost:3001`
+Required packages:
+- `@polymarket/clob-client` - Official Polymarket client
+- `ethers` - Ethereum wallet library
+- `express`, `cors`, `dotenv` - Server framework
+- `pg` or `better-sqlite3` - Database
 
-### Production Deployment
+### 2. Configure Environment
 
-#### Option 1: Railway
+```bash
+cp .env.example .env
+```
 
-1. Create new project on [Railway](https://railway.app)
-2. Connect your GitHub repository
-3. Add PostgreSQL database service
-4. Set environment variables:
-   ```
-   NODE_ENV=production
-   DATABASE_URL=<auto-provided-by-railway>
-   API_SECRET_KEY=<generate-with-openssl-rand-base64-32>
-   FRONTEND_URL=https://your-lovable-app.lovable.app
-   ```
-5. Deploy automatically on push
+Edit `.env` with your settings:
 
-#### Option 2: Render
+```bash
+# Authentication (generate with: openssl rand -base64 32)
+API_SECRET_KEY=your_secret_key_here
 
-1. Create new Web Service on [Render](https://render.com)
-2. Connect your GitHub repository
-3. Set build command: `npm install`
-4. Set start command: `npm start`
-5. Add PostgreSQL database
-6. Set environment variables (same as Railway)
+# Wallet for signing (REQUIRED - this wallet signs on behalf of users)
+WALLET_PRIVATE_KEY=0xYourPrivateKeyHere
+
+# Frontend URL for CORS
+FRONTEND_URL=https://your-app.lovable.app
+```
+
+### 3. Get Your Egress IP
+
+Start the server and check your public IP:
+
+```bash
+npm start
+
+# In another terminal:
+curl http://localhost:3001/api/polymarket/ip
+```
+
+Example response:
+```json
+{
+  "success": true,
+  "egressIp": "54.188.71.94",
+  "message": "This is the IP address that Polymarket sees from this relay server",
+  "instructions": "Contact Polymarket support to whitelist this IP for CLOB API access"
+}
+```
+
+### 4. Request IP Whitelisting from Polymarket
+
+**Critical Step**: Your relay server's IP must be whitelisted by Polymarket.
+
+Contact: **support@polymarket.com**
+
+Template email:
+```
+Subject: IP Whitelist Request for Trading Application
+
+Hello Polymarket,
+
+I'm building a prediction markets trading application and need to whitelist 
+my server IP for CLOB API access.
+
+IP Address: [YOUR_EGRESS_IP]
+Use Case: Prediction markets trading platform using official clob-client
+Application: https://your-app.lovable.app
+
+Thank you!
+```
+
+## Deployment Options
+
+### Option 1: VPS (Recommended)
+
+Deploy to a VPS with a **static IP**:
+- **DigitalOcean** Droplet
+- **Linode** VPS
+- **Vultr** Cloud Compute
+- **AWS EC2** (with Elastic IP)
+
+**Why VPS?** You control the IP address and it won't change.
+
+### Option 2: Dedicated Server
+
+For production, use a dedicated server with a guaranteed static IP.
+
+### ⚠️ NOT Recommended
+
+These platforms use dynamic/shared IPs that get blocked:
+- ❌ Vercel
+- ❌ Netlify
+- ❌ Railway (shared egress)
+- ❌ Render (shared egress)
 
 ## API Endpoints
 
-### 1. Health Check
+### Get Server IP
 ```bash
-GET /health
+GET /api/polymarket/ip
 
 Response:
 {
-  "status": "ok",
-  "timestamp": 1234567890,
-  "uptime": 123.456
+  "success": true,
+  "egressIp": "54.188.71.94",
+  "instructions": "Contact Polymarket support to whitelist this IP..."
 }
 ```
 
-### 2. Store Credentials
+### Health Check
 ```bash
-POST /api/polymarket/credentials
-Headers:
-  Authorization: Bearer <your-api-secret>
-Body:
-{
-  "userId": "user-uuid",
-  "apiKey": "poly-api-key",
-  "secret": "poly-secret",
-  "passphrase": "poly-passphrase",
-  "walletAddress": "0x...",
-  "funderAddress": "0x..." (optional)
-}
+GET /api/polymarket/health
 
 Response:
 {
-  "success": true
+  "success": true,
+  "service": "polymarket-relay",
+  "version": "2.0.0",
+  "client": "@polymarket/clob-client v4.22.7",
+  "timestamp": "2025-10-17T05:55:00.000Z"
 }
 ```
 
-### 3. Execute Trade
+### Execute Trade
 ```bash
 POST /api/polymarket/trade
-Headers:
-  Authorization: Bearer <your-api-secret>
+Authorization: Bearer YOUR_API_SECRET_KEY
+
 Body:
 {
   "userId": "user-uuid",
+  "walletAddress": "0x...",
   "signedOrder": {
-    "salt": "...",
+    "salt": "123...",
     "maker": "0x...",
     "signer": "0x...",
     "taker": "0x0000000000000000000000000000000000000000",
-    "tokenId": "123...",
+    "tokenId": "456...",
     "makerAmount": "1000000",
     "takerAmount": "500000",
     "expiration": "1234567890",
@@ -115,141 +178,122 @@ Body:
     "signatureType": 2,
     "signature": "0x..."
   },
-  "walletAddress": "0x...",
-  "funderAddress": "0x..." (optional)
+  "credentials": {
+    "api_key": "...",
+    "secret": "...",
+    "passphrase": "..."
+  }
 }
 
-Response (success):
+Response:
 {
   "success": true,
-  "orderId": "abc123...",
-  "attemptedWith": "owner" | "funder"
-}
-
-Response (error):
-{
-  "success": false,
-  "error": "Trade failed: insufficient balance",
-  "attemptedWith": "owner" | "funder"
+  "data": {
+    "orderID": "0x...",
+    "status": "LIVE"
+  }
 }
 ```
 
-### 4. Check Trading Status
-```bash
-GET /api/polymarket/status?userId=user-uuid
-Headers:
-  Authorization: Bearer <your-api-secret>
+## Integration with Lovable App
 
-Response:
-{
-  "tradingEnabled": true,
-  "closedOnly": false
-}
-```
+Update your Edge Function to use the relay:
 
-### 5. Delete Credentials
-```bash
-DELETE /api/polymarket/credentials/:userId
-Headers:
-  Authorization: Bearer <your-api-secret>
+```typescript
+// In supabase/functions/polymarket-trade/index.ts
 
-Response:
-{
-  "success": true
-}
+const RELAY_URL = Deno.env.get('RELAY_URL') || 'http://localhost:3001';
+const RELAY_SECRET = Deno.env.get('API_SECRET_KEY');
+
+const relayResponse = await fetch(`${RELAY_URL}/api/polymarket/trade`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${RELAY_SECRET}`,
+  },
+  body: JSON.stringify({
+    userId: user.id,
+    walletAddress,
+    signedOrder,
+    credentials: {
+      api_key: creds.api_credentials_key,
+      secret: creds.api_credentials_secret,
+      passphrase: creds.api_credentials_passphrase,
+    }
+  }),
+});
 ```
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PORT` | Server port | `3001` |
-| `NODE_ENV` | Environment (`development` or `production`) | `development` |
-| `DATABASE_URL` | PostgreSQL connection string (production only) | SQLite in dev |
-| `API_SECRET_KEY` | Shared secret for authentication | `dev-secret-key...` |
-| `FRONTEND_URL` | Your Lovable app URL for CORS | - |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `API_SECRET_KEY` | ✅ | Shared secret for authentication |
+| `WALLET_PRIVATE_KEY` | ✅ | Private key for ClobClient signing |
+| `FRONTEND_URL` | ✅ | Your Lovable app URL (for CORS) |
+| `PORT` | ❌ | Server port (default: 3001) |
+| `CLOB_API_URL` | ❌ | Polymarket API URL (default: https://clob.polymarket.com) |
+| `DATABASE_URL` | ❌ | PostgreSQL connection (optional, uses SQLite if not set) |
 
-## Database Schema
+## Security Checklist
 
-```sql
-CREATE TABLE user_credentials (
-  user_id TEXT PRIMARY KEY,
-  api_key TEXT NOT NULL,
-  secret TEXT NOT NULL,
-  passphrase TEXT NOT NULL,
-  wallet_address TEXT NOT NULL,
-  funder_address TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_wallet_address ON user_credentials(wallet_address);
-```
-
-## Security Notes
-
-- Never commit `.env` file to version control
-- Generate a strong `API_SECRET_KEY` for production: `openssl rand -base64 32`
-- Use HTTPS in production (automatic on Railway/Render)
-- Credentials are stored encrypted at rest in PostgreSQL
-- Rate limiting prevents abuse (10 requests/min per user)
-- CORS is configured to only allow your Lovable app
-
-## Integration with Lovable App
-
-Update your Lovable app to use the relay:
-
-1. Add relay URL to environment:
-   ```bash
-   VITE_RELAY_URL=https://your-relay.railway.app
-   ```
-
-2. Update trade function in `src/pages/MarketDetail.tsx`:
-   ```typescript
-   const relayUrl = import.meta.env.VITE_RELAY_URL;
-   const response = await fetch(`${relayUrl}/api/polymarket/trade`, {
-     method: 'POST',
-     headers: {
-       'Content-Type': 'application/json',
-       'Authorization': `Bearer ${YOUR_API_SECRET}`
-     },
-     body: JSON.stringify({
-       userId: user.id,
-       signedOrder,
-       walletAddress: address,
-       funderAddress
-     })
-   });
-   ```
-
-3. Update credential storage in `ConnectPolymarketDialog.tsx`
+- ✅ Never commit `.env` to git
+- ✅ Generate strong `API_SECRET_KEY`: `openssl rand -base64 32`
+- ✅ Use HTTPS in production
+- ✅ Implement rate limiting (built-in: 10 req/min per user)
+- ✅ Restrict CORS to your frontend only
+- ✅ Store credentials encrypted in database
+- ✅ Use static IP that won't change
 
 ## Troubleshooting
 
-### Port already in use
-```bash
-# Kill process on port 3001
-lsof -ti:3001 | xargs kill -9
+### Still Getting 403 Errors?
 
-# Or use a different port
-PORT=3002 npm run dev
+1. **Check your egress IP**:
+   ```bash
+   curl https://your-relay.com/api/polymarket/ip
+   ```
+
+2. **Verify IP is whitelisted**: Contact Polymarket support
+
+3. **Check Cloudflare Ray ID** in error response - send to Polymarket
+
+### Authentication Errors?
+
+Ensure `API_SECRET_KEY` matches between:
+- Your Edge Function (`API_SECRET_KEY` secret in Supabase)
+- Your Relay Server (`.env` file)
+
+### ClobClient Errors?
+
+Make sure `WALLET_PRIVATE_KEY` is set and valid:
+```bash
+# Check if private key is loaded
+curl http://localhost:3001/api/polymarket/health
 ```
 
-### Database errors
-```bash
-# Reset SQLite database (development)
-rm dev.db
-npm run dev
+## Monitoring
 
-# Check PostgreSQL connection (production)
-psql $DATABASE_URL
+### Check Server Status
+```bash
+curl https://your-relay.com/api/polymarket/health
 ```
 
-### CORS errors
-Ensure `FRONTEND_URL` in `.env` matches your Lovable app URL exactly (no trailing slash).
+### Check Egress IP Hasn't Changed
+```bash
+curl https://your-relay.com/api/polymarket/ip
+```
+
+Set up monitoring to alert you if the IP changes!
 
 ## Support
 
-For issues or questions, check the logs:
-- Development: Console output
-- Production: Railway/Render logs dashboard
+For issues:
+1. Check server logs
+2. Verify IP is still whitelisted
+3. Test with `curl` commands above
+4. Contact Polymarket support if blocked
+
+## License
+
+MIT
