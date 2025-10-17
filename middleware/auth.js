@@ -15,22 +15,40 @@ const RATE_LIMIT_MAX_REQUESTS = 10;
 export function authenticateRequest(req, res, next) {
   const authHeader = req.headers.authorization;
   
+  console.log('🔐 AUTH DEBUG:', {
+    hasAuthHeader: !!authHeader,
+    authHeaderPreview: authHeader ? authHeader.slice(0, 20) + '...' : 'none',
+    hasApiSecret: !!API_SECRET,
+    apiSecretPreview: API_SECRET ? API_SECRET.slice(0, 8) + '...' : 'none',
+    nodeEnv: process.env.NODE_ENV
+  });
+  
   if (!authHeader) {
+    console.error('❌ Missing authorization header');
     return res.status(401).json({ error: 'Missing authorization header' });
   }
   
   // Support both "Bearer <token>" and "Bearer <jwt>" formats
   const token = authHeader.replace(/^Bearer\s+/i, '');
   
+  console.log('🔍 Token comparison:', {
+    receivedTokenPreview: token.slice(0, 8) + '...',
+    expectedTokenPreview: API_SECRET.slice(0, 8) + '...',
+    tokensMatch: token === API_SECRET,
+    isJWT: token.includes('.')
+  });
+  
   // For development, accept any token
   // In production, validate JWT from Supabase or check API secret
   if (process.env.NODE_ENV === 'production') {
     // Simple API key check (enhance with JWT validation if needed)
     if (token !== API_SECRET && !token.includes('.')) { // Allow JWTs (contain dots)
+      console.error('❌ AUTH FAILED: Invalid API key');
       return res.status(403).json({ error: 'Invalid API key' });
     }
   }
   
+  console.log('✅ Authentication successful');
   next();
 }
 
