@@ -4,8 +4,6 @@ import dotenv from 'dotenv';
 import { initDatabase } from './db/init.js';
 import polymarketRoutes from './routes/polymarket.js';
 
-dotenv.config();
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 
