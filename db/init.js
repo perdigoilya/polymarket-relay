@@ -12,9 +12,10 @@ let db;
  * Uses SQLite for development, PostgreSQL for production
  */
 export async function initDatabase() {
-  const isProduction = process.env.DATABASE_URL || process.env.NODE_ENV === 'production';
+  // Only use PostgreSQL if DATABASE_URL is explicitly provided
+  const hasDatabase = !!process.env.DATABASE_URL;
   
-  if (isProduction) {
+  if (hasDatabase) {
     console.log('📊 Connecting to PostgreSQL...');
     const pg = await import('pg');
     const { Pool } = pg.default;
@@ -93,5 +94,5 @@ export function getDb() {
  * Check if using PostgreSQL
  */
 export function isPostgres() {
-  return !!(process.env.DATABASE_URL || process.env.NODE_ENV === 'production');
+  return !!process.env.DATABASE_URL;
 }
